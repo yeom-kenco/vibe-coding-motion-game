@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   metadataBase: new URL(
-    process.env.NEXT_PUBLIC_SITE_URL ?? "https://motion-fruit-shooter.vercel.app",
+    process.env.NEXT_PUBLIC_SITE_URL ?? "https://vibe-coding-motion-game.vercel.app",
   ),
   title: "모션 과일 슈팅 게임 | 웹캠 손 제스처 슈팅 게임",
   description:

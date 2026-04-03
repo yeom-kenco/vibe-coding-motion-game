@@ -72,6 +72,12 @@ type MuzzleFlash = {
   startAt: number;
 };
 
+type LeaderboardEntry = {
+  id: string;
+  name: string;
+  score: number;
+};
+
 type HandLm = { x: number; y: number };
 
 type GestureSnapshot = {
@@ -86,7 +92,7 @@ type GestureSnapshot = {
 const MEDIAPIPE_TASKS_VERSION = "0.10.34";
 const GAME_MS = 30_000;
 const SHOT_COOLDOWN_MS = 320;
-const HIT_RADIUS_PX = 140;
+const HIT_RADIUS_PX = 40;
 const MAX_FRUITS_ON_SCREEN = 5;
 const HUD_FRAME_INTERVAL = 18;
 const STAR_COUNT = 100;
@@ -505,6 +511,11 @@ export function MotionShooterGame() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [handTracked, setHandTracked] = useState(false);
 
+  // Leaderboard (in-memory, resets on page refresh)
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [nameInput, setNameInput] = useState("");
+  const [scoreRecorded, setScoreRecorded] = useState(false);
+
   const fruitKinds = useMemo(
     () => ["apple", "lemon", "grape", "watermelon", "cherry"] as const,
     [],
@@ -627,8 +638,8 @@ export function MotionShooterGame() {
 
   function spawnFruit(w: number) {
     const kind = pick(fruitKinds);
-    const minSize = Math.max(150, w * 0.24);
-    const maxSize = Math.max(minSize + 1, Math.max(210, w * 0.34));
+    const minSize = Math.max(80, w * 0.1);
+    const maxSize = Math.max(minSize + 1, Math.max(120, w * 0.18));
     const size = rand(minSize, maxSize);
 
     const { sprite } = FRUIT_SPRITES[kind];
@@ -640,8 +651,8 @@ export function MotionShooterGame() {
 
     const x = renderW >= w ? w / 2 : rand(halfW, Math.max(halfW + 1, w - halfW));
     const y = -halfH - rand(0, 120);
-    const vy = rand(30, 50);
-    const vx = rand(-8, 8);
+    const vy = rand(55, 90);
+    const vx = rand(-12, 12);
     fruitsRef.current.push({
       id: uid("f"),
       kind,
@@ -717,7 +728,7 @@ export function MotionShooterGame() {
     let hits = 0;
     const remaining: Fruit[] = [];
     for (const f of fruitsRef.current) {
-      if (dist(f.pos, aim) <= HIT_RADIUS_PX + f.size * 0.42) {
+      if (dist(f.pos, aim) <= HIT_RADIUS_PX + f.size*0.2) {
         hits++;
         const color = fruitBaseColor(f.kind);
         explode(f.pos, color, true);
@@ -1061,7 +1072,7 @@ export function MotionShooterGame() {
       if (!runningRef.current) return ms;
       const next = Math.max(0, ms - dt * 1000);
       currentTimeLeft = next;
-      if (next <= 0 && status === "running") {
+      if (next <= 0 && runningRef.current) {
         runningRef.current = false;
         setStatus("ended");
         audioRef.current?.gameEnd();
@@ -1146,6 +1157,8 @@ export function MotionShooterGame() {
     lastHandOkRef.current = false;
     setScore(0);
     setCombo(0);
+    setScoreRecorded(false);
+    setNameInput("");
     setTimeLeftMs(GAME_MS);
     fruitsRef.current = [];
     particlesRef.current = [];
@@ -1231,8 +1244,34 @@ export function MotionShooterGame() {
     };
   }
 
+  function recordScore() {
+    const trimmed = nameInput.trim();
+    if (!trimmed || scoreRecorded) return;
+    const entry: LeaderboardEntry = { id: uid("lb"), name: trimmed, score };
+    setLeaderboard((prev) => {
+      const next = [...prev, entry].sort((a, b) => b.score - a.score).slice(0, 5);
+      return next;
+    });
+    setScoreRecorded(true);
+  }
+
   const timeLeftSec = Math.ceil(timeLeftMs / 1000);
   const isUrgent = status === "running" && timeLeftSec <= URGENCY_THRESHOLD_S;
+
+  const RANK_STYLES: Record<number, string> = {
+    0: "text-amber-300",     // 1st - gold
+    1: "text-slate-300",     // 2nd - silver
+    2: "text-orange-400",    // 3rd - bronze
+    3: "text-zinc-500",      // 4th
+    4: "text-zinc-600",      // 5th
+  };
+  const RANK_BADGE: Record<number, string> = {
+    0: "bg-amber-400/20 border-amber-400/40 text-amber-300",
+    1: "bg-slate-400/15 border-slate-400/30 text-slate-300",
+    2: "bg-orange-400/15 border-orange-400/30 text-orange-400",
+    3: "bg-zinc-800/40 border-zinc-700/30 text-zinc-500",
+    4: "bg-zinc-800/40 border-zinc-700/30 text-zinc-600",
+  };
 
   return (
     <div className="relative h-dvh w-full overflow-hidden font-sans antialiased text-white">
@@ -1260,7 +1299,7 @@ export function MotionShooterGame() {
           <div className="flex flex-wrap items-center gap-3">
             <div className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-zinc-950/55 px-4 py-2.5 shadow-lg shadow-violet-500/10 backdrop-blur-xl">
               <span className="text-lg font-semibold tracking-tight bg-linear-to-r from-violet-200 via-white to-cyan-200 bg-clip-text text-transparent">
-                모션 과일 슈터
+                모션 과일 슈팅 게임
               </span>
               <span className="hidden text-xs text-zinc-400 sm:inline">웹캠 · 손 제스처</span>
             </div>
@@ -1317,11 +1356,11 @@ export function MotionShooterGame() {
               조작법
             </div>
             <p>
-              <span className="font-medium text-cyan-200">조준:</span> 검지를 펴서 가리키기
+              <span className="font-medium text-cyan-200">조준:</span> 검지를 펴서 가리키거나 총 모양을 보여주기! (검지 끝을 인식해요)
             </p>
             <p className="mt-1">
               <span className="font-medium text-amber-200">발사:</span> 조준 상태에서 손을 아래로
-              빠르게 톡 치기, 또는 엄지로 검지 아래쪽 톡 누르기
+              빠르게 위로 슈팅! 혹은 아래로 툭 치기!
             </p>
             <p className="mt-1">
               <span className="font-medium text-fuchsia-200">콤보:</span> 빠르게 연속 명중하면
@@ -1361,9 +1400,34 @@ export function MotionShooterGame() {
         </div>
       </div>
 
+      {/* ── Leaderboard (top-right, always visible when entries exist) ── */}
+      {leaderboard.length > 0 ? (
+        <div className="pointer-events-none absolute top-16 right-3 z-20 sm:top-20 sm:right-5">
+          <div className="w-56 rounded-2xl border border-white/10 bg-zinc-950/60 p-3 shadow-lg backdrop-blur-xl">
+            <div className="mb-2 text-center text-xs font-semibold uppercase tracking-wider text-zinc-500">
+              Top 5
+            </div>
+            <div className="space-y-1">
+              {leaderboard.map((entry, i) => (
+                <div
+                  key={entry.id}
+                  className={`flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-xs ${RANK_BADGE[i] ?? "bg-zinc-800/40 border-zinc-700/30 text-zinc-600"}`}
+                >
+                  <span className="w-5 shrink-0 text-center font-bold">{i + 1}</span>
+                  <span className={`flex-1 truncate font-medium ${RANK_STYLES[i] ?? "text-zinc-600"}`}>
+                    {entry.name}
+                  </span>
+                  <span className="shrink-0 tabular-nums font-semibold">{entry.score}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {/* ── Game Over overlay ── */}
       {status === "ended" ? (
-        <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center p-6">
+        <div className="pointer-events-auto absolute inset-0 z-20 grid place-items-center p-6">
           <div className="w-full max-w-md rounded-3xl border border-white/15 bg-zinc-950/75 p-8 text-center shadow-2xl shadow-violet-500/20 backdrop-blur-2xl">
             <div className="text-sm font-medium uppercase tracking-[0.2em] text-zinc-500">
               라운드 종료
@@ -1373,7 +1437,39 @@ export function MotionShooterGame() {
             <div className="mt-1 bg-linear-to-r from-violet-200 to-cyan-200 bg-clip-text text-5xl font-bold tabular-nums text-transparent">
               {score}
             </div>
-            <p className="mt-6 text-sm text-zinc-500">
+
+            {/* Name input for leaderboard */}
+            {!scoreRecorded ? (
+              <div className="mt-6">
+                <label className="block text-sm text-zinc-400 mb-2">이름을 입력하고 점수를 기록하세요</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    maxLength={12}
+                    placeholder="닉네임 (최대 12자)"
+                    value={nameInput}
+                    onChange={(e) => setNameInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") recordScore(); }}
+                    className="flex-1 rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white placeholder-zinc-500 outline-none focus:border-violet-400/50 focus:ring-1 focus:ring-violet-400/30 backdrop-blur-md"
+                    autoFocus
+                  />
+                  <button
+                    type="button"
+                    onClick={recordScore}
+                    disabled={!nameInput.trim()}
+                    className="rounded-xl bg-violet-500/80 px-4 py-2 text-sm font-semibold text-white transition hover:bg-violet-500 active:bg-violet-600 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    기록
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="mt-6 rounded-xl border border-emerald-500/20 bg-emerald-950/30 px-4 py-2.5 text-sm text-emerald-300">
+                점수가 기록되었습니다!
+              </div>
+            )}
+
+            <p className="mt-5 text-sm text-zinc-500">
               아래 <span className="text-zinc-300">다시 플레이</span>로 이어서 할 수 있어요.
             </p>
           </div>

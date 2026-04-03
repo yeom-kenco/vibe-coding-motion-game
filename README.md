@@ -1,58 +1,42 @@
-## 모션 과일 슈터
+# 모션 과일 슈터
 
-웹캠으로 손을 인식해서 **핀치(엄지+검지)** 동작으로 과일 아이템을 쏘고 점수를 얻는 미니 게임입니다.
+웹캠과 손 제스처만으로 과일을 쏘는 브라우저 미니 게임입니다.  
+MediaPipe Hand Landmarker 기반 실시간 손 인식으로, 설치 없이 바로 플레이할 수 있습니다.
 
-### 로컬 실행
+## 주요 기능
+
+- **손 제스처 인식** — 검지로 조준, 손목 리코일/엄지 트리거로 발사
+- **콤보 시스템** — 연속 명중 시 점수 배율 증가
+- **효과음** — Web Audio API 기반 합성 사운드 (발사, 명중, 콤보, 카운트다운 등)
+- **화려한 연출** — 별 배경, 파티클 폭발, 머즐 플래시, 스크린 셰이크, 긴박감 비네트
+- **리더보드** — 게임 종료 후 닉네임 입력, Top 5 점수 기록 (세션 내)
+- **반응형** — 데스크탑/모바일 모두 지원
+
+## 조작 방법
+
+| 동작              | 설명                                                |
+| ----------------- | --------------------------------------------------- |
+| **조준**          | 검지를 펴서 화면 방향을 가리킵니다                  |
+| **발사** (방법 1) | 조준 상태에서 손을 아래로 빠르게 톡 (손목 리코일)   |
+| **발사** (방법 2) | 조준 상태에서 엄지로 검지 아래쪽을 톡 (엄지 트리거) |
+| **발사** (방법 3) | 조준 상태에서 검지를 위로 빠르게 플릭               |
+
+30초 안에 최대한 많은 과일을 맞추세요!
+
+## 기술 스택
+
+- **Next.js** (App Router)
+- **TypeScript**
+- **Tailwind CSS**
+- **MediaPipe Tasks Vision** — 손 랜드마크 인식
+- **Web Audio API** — 실시간 합성 효과음
+- **Canvas 2D** — 게임 렌더링
+
+## 로컬 실행
 
 ```bash
 npm install
 npm run dev
 ```
 
-브라우저에서 `http://localhost:3000` 접속 후 **시작하기**를 눌러 카메라 권한을 허용하세요.
-
-### 조작 방법
-
-- **조준**: 검지 끝 위치가 조준점입니다.
-- **발사**: 엄지와 검지를 붙이는 핀치 동작을 하면 발사됩니다.
-- **목표**: 제한 시간(30초) 안에 최대 점수를 얻으세요.
-
-### 배포 (Vercel)
-
-- 이 프로젝트는 브라우저에서만 웹캠을 사용합니다. Vercel에 그대로 배포 가능합니다.
-- Vercel에서 Import 후 기본 설정(Framework: Next.js)으로 배포하면 됩니다.
-
-## Getting Started
-
-First, run the development server:
-
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+접속 후 **게임 시작**을 눌러 카메라 권한을 허용하세요.

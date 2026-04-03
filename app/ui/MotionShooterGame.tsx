@@ -143,6 +143,17 @@ class GameAudio {
     return this.ctx;
   }
 
+  /** 유저 제스처 컨텍스트 안에서 호출하여 iOS Safari unlock */
+  unlock() {
+    const ctx = this.ensure();
+    // iOS Safari는 빈 버퍼를 재생해야 완전히 unlock됨
+    const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(0);
+  }
+
   /** "피우" 사운드 */
   shoot() {
     const c = this.ensure();
@@ -1149,8 +1160,9 @@ export function MotionShooterGame() {
     if (!ready) return;
     if (status === "requesting_camera" || status === "running") return;
 
-    // Init audio
+    // Init audio — 반드시 유저 클릭 핸들러 안에서 unlock (iOS Safari 정책)
     if (!audioRef.current) audioRef.current = new GameAudio();
+    audioRef.current.unlock();
 
     setErrorMsg(null);
     setHandTracked(false);
@@ -1351,7 +1363,7 @@ export function MotionShooterGame() {
       {/* ── Bottom HUD ── */}
       <div className="absolute inset-x-0 bottom-0 z-30 p-3 sm:p-5">
         <div className="mx-auto flex max-w-5xl flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-          <div className="max-w-xl rounded-2xl border border-white/10 bg-zinc-950/50 p-4 text-sm leading-relaxed text-zinc-300 shadow-lg backdrop-blur-xl">
+          <div className={`max-w-xl rounded-2xl border border-white/10 bg-zinc-950/50 p-4 text-sm leading-relaxed text-zinc-300 shadow-lg backdrop-blur-xl ${status === "running" ? "hidden sm:block" : ""}`}>
             <div className="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">
               조작법
             </div>

@@ -7,8 +7,9 @@ import {
   type HandLandmarkerResult,
 } from "@mediapipe/tasks-vision";
 
-type Vec2 = { x: number; y: number };
+// ─── Types ───────────────────────────────────────────────
 
+type Vec2 = { x: number; y: number };
 type FruitKind = "apple" | "lemon" | "grape" | "watermelon" | "cherry";
 
 type Fruit = {
@@ -19,6 +20,7 @@ type Fruit = {
   size: number;
   rotation: number;
   spin: number;
+  spawnedAt: number;
 };
 
 type Particle = {
@@ -29,55 +31,249 @@ type Particle = {
   bornAt: number;
   size: number;
   color: string;
+  glow: boolean;
+};
+
+type ScorePopup = {
+  id: string;
+  pos: Vec2;
+  value: number;
+  combo: number;
+  bornAt: number;
+};
+
+type Star = {
+  x: number;
+  y: number;
+  size: number;
+  speed: number;
+  alpha: number;
+  twinkleOffset: number;
 };
 
 type Crosshair = {
   pos: Vec2;
+  smoothPos: Vec2;
   aimPoseActive: boolean;
   shootGestureActive: boolean;
   lastShotAt: number;
-  confidence: number; // 0..1
+  confidence: number;
+  trail: Vec2[];
+};
+
+type Shake = {
+  intensity: number;
+  startAt: number;
+  durationMs: number;
+};
+
+type MuzzleFlash = {
+  pos: Vec2;
+  startAt: number;
 };
 
 type HandLm = { x: number; y: number };
 
-/** package.json과 맞추면 wasm/model 불일치로 추론이 죽는 경우를 줄일 수 있음 */
-const MEDIAPIPE_TASKS_VERSION = "0.10.34";
+type GestureSnapshot = {
+  indexTip: Vec2;
+  wrist: Vec2;
+  thumbToIndexMcp: number;
+  t: number;
+};
 
+// ─── Constants ───────────────────────────────────────────
+
+const MEDIAPIPE_TASKS_VERSION = "0.10.34";
 const GAME_MS = 30_000;
-/** 한 제스처당 한 발: 자세를 풀었다가 다시 해야 연사 가능 */
-const SHOT_COOLDOWN_MS = 380;
-const HIT_RADIUS_PX = 130;
-const MAX_FRUITS_ON_SCREEN = 4;
+const SHOT_COOLDOWN_MS = 320;
+const HIT_RADIUS_PX = 140;
+const MAX_FRUITS_ON_SCREEN = 5;
 const HUD_FRAME_INTERVAL = 18;
+const STAR_COUNT = 100;
+const TRAIL_LEN = 10;
+const GESTURE_HISTORY_MAX = 15;
+const COMBO_WINDOW_MS = 2500;
+const SHAKE_MS = 160;
+const MUZZLE_MS = 100;
+const POPUP_MS = 1400;
+const URGENCY_THRESHOLD_S = 10;
+
+// ─── Utilities ───────────────────────────────────────────
 
 function clamp01(v: number) {
   return Math.max(0, Math.min(1, v));
 }
-
 function dist(a: Vec2, b: Vec2) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.hypot(dx, dy);
+  return Math.hypot(a.x - b.x, a.y - b.y);
 }
-
 function rand(min: number, max: number) {
   return min + Math.random() * (max - min);
 }
-
 function pick<T>(arr: readonly T[]) {
   return arr[Math.floor(Math.random() * arr.length)]!;
 }
-
 function uid(prefix: string) {
-  return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
+  return `${prefix}_${Math.random().toString(16).slice(2)}`;
 }
-
 function lmDist(a: HandLm, b: HandLm) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
+function lerp(a: number, b: number, t: number) {
+  return a + (b - a) * t;
+}
 
-/** 손목 기준으로 손가락이 펴졌는지(조준용 검지 등) */
+// ─── Sound System (Web Audio synthesis) ──────────────────
+
+class GameAudio {
+  private ctx: AudioContext | null = null;
+
+  private ensure(): AudioContext {
+    if (!this.ctx || this.ctx.state === "closed") {
+      this.ctx = new AudioContext();
+    }
+    if (this.ctx.state === "suspended") {
+      this.ctx.resume();
+    }
+    return this.ctx;
+  }
+
+  /** "피우" 사운드 */
+  shoot() {
+    const c = this.ensure();
+    const t = c.currentTime;
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(1400, t);
+    o.frequency.exponentialRampToValueAtTime(350, t + 0.09);
+    g.gain.setValueAtTime(0.22, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    o.connect(g).connect(c.destination);
+    o.start(t);
+    o.stop(t + 0.12);
+  }
+
+  /** 귀여운 "팝" 사운드 */
+  hit() {
+    const c = this.ensure();
+    const t = c.currentTime;
+    // tonal pop
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(520, t);
+    o.frequency.exponentialRampToValueAtTime(1100, t + 0.04);
+    o.frequency.exponentialRampToValueAtTime(300, t + 0.18);
+    g.gain.setValueAtTime(0.28, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+    o.connect(g).connect(c.destination);
+    o.start(t);
+    o.stop(t + 0.22);
+    // noise burst
+    const len = Math.floor(c.sampleRate * 0.04);
+    const buf = c.createBuffer(1, len, c.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const ns = c.createBufferSource();
+    ns.buffer = buf;
+    const ng = c.createGain();
+    ng.gain.setValueAtTime(0.12, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+    ns.connect(ng).connect(c.destination);
+    ns.start(t);
+    ns.stop(t + 0.06);
+  }
+
+  /** 콤보 차임 (콤보 수에 따라 피치 상승) */
+  combo(count: number) {
+    const c = this.ensure();
+    const t = c.currentTime;
+    const freq = 660 + Math.min(count, 10) * 80;
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = "triangle";
+    o.frequency.setValueAtTime(freq, t);
+    o.frequency.exponentialRampToValueAtTime(freq * 1.6, t + 0.08);
+    g.gain.setValueAtTime(0.18, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    o.connect(g).connect(c.destination);
+    o.start(t);
+    o.stop(t + 0.18);
+  }
+
+  /** 카운트다운 틱 */
+  tick() {
+    const c = this.ensure();
+    const t = c.currentTime;
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(1000, t);
+    g.gain.setValueAtTime(0.13, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+    o.connect(g).connect(c.destination);
+    o.start(t);
+    o.stop(t + 0.05);
+  }
+
+  /** 게임 시작 징글 */
+  gameStart() {
+    const c = this.ensure();
+    const t = c.currentTime;
+    [523, 659, 784, 1047].forEach((f, i) => {
+      const o = c.createOscillator();
+      const g = c.createGain();
+      o.type = "triangle";
+      o.frequency.setValueAtTime(f, t + i * 0.09);
+      g.gain.setValueAtTime(0.18, t + i * 0.09);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.09 + 0.14);
+      o.connect(g).connect(c.destination);
+      o.start(t + i * 0.09);
+      o.stop(t + i * 0.09 + 0.14);
+    });
+  }
+
+  /** 게임 종료 징글 */
+  gameEnd() {
+    const c = this.ensure();
+    const t = c.currentTime;
+    [784, 659, 523, 392].forEach((f, i) => {
+      const o = c.createOscillator();
+      const g = c.createGain();
+      o.type = "triangle";
+      o.frequency.setValueAtTime(f, t + i * 0.11);
+      g.gain.setValueAtTime(0.18, t + i * 0.11);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.11 + 0.2);
+      o.connect(g).connect(c.destination);
+      o.start(t + i * 0.11);
+      o.stop(t + i * 0.11 + 0.2);
+    });
+  }
+
+  /** 미스 사운드 */
+  miss() {
+    const c = this.ensure();
+    const t = c.currentTime;
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(300, t);
+    o.frequency.exponentialRampToValueAtTime(150, t + 0.15);
+    g.gain.setValueAtTime(0.1, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    o.connect(g).connect(c.destination);
+    o.start(t);
+    o.stop(t + 0.18);
+  }
+
+  close() {
+    this.ctx?.close();
+    this.ctx = null;
+  }
+}
+
+// ─── Hand gesture helpers ────────────────────────────────
+
 function fingerExtendedFromWrist(
   lm: HandLm[],
   tipIdx: number,
@@ -88,26 +284,66 @@ function fingerExtendedFromWrist(
   return lmDist(lm[tipIdx]!, lm[wristIdx]!) > lmDist(lm[pipIdx]!, lm[wristIdx]!) * ratio;
 }
 
-/** 조준: 오직 검지(손목 기준)만 사용 */
 function isAimPose(lm: HandLm[]) {
   if (lm.length < 21) return false;
-  return fingerExtendedFromWrist(lm, 8, 6, 0, 1.06);
+  return fingerExtendedFromWrist(lm, 8, 6, 0, 1.04);
 }
 
-/** 발사: "검지를 위로 확 들어올리는" 모션(짧은 시간 내 y가 크게 감소) */
-function isIndexFlickUpShot(
-  prev: { y: number; t: number } | null,
-  cur: { y: number; t: number },
-) {
-  if (!prev) return false;
-  const dtMs = Math.max(1, cur.t - prev.t);
-  // 너무 짧거나 너무 길면 노이즈/일반 이동
-  if (dtMs < 45 || dtMs > 320) return false;
-  const dy = prev.y - cur.y; // 위로 가면 +dy (y는 위쪽이 작음)
-  const speed = dy / dtMs; // normalized per ms
-  // 충분히 "확" 올라가는 모션만
-  return dy > 0.032 && speed > 0.00018;
+/** 히스토리 버퍼에서 일정 시간 전 프레임 찾기 */
+function findOldSnapshot(
+  history: GestureSnapshot[],
+  now: number,
+  minAge: number,
+  maxAge: number,
+): GestureSnapshot | null {
+  for (let i = history.length - 2; i >= 0; i--) {
+    const age = now - history[i]!.t;
+    if (age >= minAge && age <= maxAge) return history[i]!;
+    if (age > maxAge) return null;
+  }
+  return null;
 }
+
+/** 다중 방법 슈팅 감지 */
+function detectShootGesture(
+  history: GestureSnapshot[],
+  lastAimAt: number,
+): boolean {
+  if (history.length < 3) return false;
+  const recent = history[history.length - 1]!;
+  const now = recent.t;
+
+  // 조준 grace window
+  if (now - lastAimAt > 280) return false;
+
+  // 방법 1: 검지 플릭 업
+  const oldFlick = findOldSnapshot(history, now, 50, 280);
+  if (oldFlick) {
+    const dy = oldFlick.indexTip.y - recent.indexTip.y; // 위로 → 양수
+    const dtMs = now - oldFlick.t;
+    if (dy > 0.028 && dy / dtMs > 0.00014) return true;
+  }
+
+  // 방법 2: 손목 리코일 (아래로 빠르게)
+  const oldRecoil = findOldSnapshot(history, now, 50, 220);
+  if (oldRecoil) {
+    const dy = recent.wrist.y - oldRecoil.wrist.y; // 아래로 → 양수
+    const dtMs = now - oldRecoil.t;
+    if (dy > 0.032 && dy / dtMs > 0.00016) return true;
+  }
+
+  // 방법 3: 엄지 트리거 (엄지가 검지 MCP에 접근)
+  const oldThumb = findOldSnapshot(history, now, 50, 250);
+  if (oldThumb) {
+    const delta = oldThumb.thumbToIndexMcp - recent.thumbToIndexMcp; // 좁아지면 양수
+    const dtMs = now - oldThumb.t;
+    if (delta > 0.022 && delta / dtMs > 0.0001 && recent.thumbToIndexMcp < 0.065) return true;
+  }
+
+  return false;
+}
+
+// ─── Pixel Sprites ───────────────────────────────────────
 
 function drawPixelSprite(
   ctx: CanvasRenderingContext2D,
@@ -130,13 +366,7 @@ function drawPixelSprite(
   }
 }
 
-const FRUIT_SPRITES: Record<
-  FruitKind,
-  {
-    sprite: string[];
-    palette: Record<string, string>;
-  }
-> = {
+const FRUIT_SPRITES: Record<FruitKind, { sprite: string[]; palette: Record<string, string> }> = {
   apple: {
     sprite: [
       "....gg....",
@@ -204,37 +434,73 @@ const FRUIT_SPRITES: Record<
   },
 };
 
+function fruitBaseColor(kind: FruitKind): string {
+  const p = FRUIT_SPRITES[kind].palette;
+  return p["r"] || p["y"] || p["p"] || p["g"] || "#60a5fa";
+}
+
+// ─── Star field generator ────────────────────────────────
+
+function createStars(count: number): Star[] {
+  return Array.from({ length: count }, () => ({
+    x: Math.random(),
+    y: Math.random(),
+    size: rand(0.5, 2.2),
+    speed: rand(0.002, 0.008),
+    alpha: rand(0.2, 0.8),
+    twinkleOffset: rand(0, Math.PI * 2),
+  }));
+}
+
+// ─── Component ───────────────────────────────────────────
+
 export function MotionShooterGame() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const handLandmarkerRef = useRef<HandLandmarker | null>(null);
+  const audioRef = useRef<GameAudio | null>(null);
 
   const runningRef = useRef(false);
   const rafRef = useRef<number | null>(null);
-  const lastFrameAtRef = useRef<number>(performance.now());
-  const lastSpawnAtRef = useRef<number>(performance.now());
+  const lastFrameAtRef = useRef(0);
+  const lastSpawnAtRef = useRef(0);
+  const gameStartAtRef = useRef(0);
 
   const fruitsRef = useRef<Fruit[]>([]);
   const particlesRef = useRef<Particle[]>([]);
+  const popupsRef = useRef<ScorePopup[]>([]);
+  const starsRef = useRef<Star[]>(createStars(STAR_COUNT));
+  const shakeRef = useRef<Shake | null>(null);
+  const muzzleRef = useRef<MuzzleFlash | null>(null);
+
   const lastHandOkRef = useRef(false);
   const hudFrameRef = useRef(0);
-  const gestureRef = useRef({
-    prevIndex: null as { y: number; t: number } | null,
-    lastAimAt: 0,
-  });
+
+  // Gesture
+  const gestureHistoryRef = useRef<GestureSnapshot[]>([]);
+  const lastAimAtRef = useRef(0);
   const crosshairRef = useRef<Crosshair>({
     pos: { x: 0.5, y: 0.6 },
+    smoothPos: { x: 0.5, y: 0.6 },
     aimPoseActive: false,
     shootGestureActive: false,
     lastShotAt: 0,
     confidence: 0,
+    trail: [],
   });
+
+  // Combo
+  const comboRef = useRef({ count: 0, lastHitAt: 0 });
+
+  // Countdown tick tracking
+  const lastTickSecRef = useRef(-1);
 
   const [ready, setReady] = useState(false);
   const [status, setStatus] = useState<
     "idle" | "requesting_camera" | "running" | "ended" | "error"
   >("idle");
   const [score, setScore] = useState(0);
+  const [combo, setCombo] = useState(0);
   const [timeLeftMs, setTimeLeftMs] = useState(GAME_MS);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [handTracked, setHandTracked] = useState(false);
@@ -271,8 +537,12 @@ export function MotionShooterGame() {
       rafRef.current = null;
       handLandmarkerRef.current?.close();
       handLandmarkerRef.current = null;
+      audioRef.current?.close();
+      audioRef.current = null;
     };
   }, []);
+
+  // ─── Hand processing ────────────────────────────────
 
   function applyHandResult(result: HandLandmarkerResult) {
     const landmarks = result.landmarks?.[0] as HandLm[] | undefined;
@@ -287,11 +557,25 @@ export function MotionShooterGame() {
     }
 
     lastHandOkRef.current = true;
-
+    const now = performance.now();
     const indexTip = landmarks[8]!;
-    const aimPose = isAimPose(landmarks);
-    if (aimPose) gestureRef.current.lastAimAt = performance.now();
+    const wrist = landmarks[0]!;
+    const thumbTip = landmarks[4]!;
+    const indexMcp = landmarks[5]!;
 
+    // 히스토리에 추가
+    const history = gestureHistoryRef.current;
+    history.push({
+      indexTip: { x: indexTip.x, y: indexTip.y },
+      wrist: { x: wrist.x, y: wrist.y },
+      thumbToIndexMcp: lmDist(thumbTip, indexMcp),
+      t: now,
+    });
+    // 오래된 항목 제거
+    while (history.length > GESTURE_HISTORY_MAX) history.shift();
+
+    const aimPose = isAimPose(landmarks);
+    if (aimPose) lastAimAtRef.current = now;
     crosshair.aimPoseActive = aimPose;
 
     if (aimPose) {
@@ -303,20 +587,14 @@ export function MotionShooterGame() {
       crosshair.confidence = Math.max(0, crosshair.confidence - 0.12);
     }
 
-    // 발사는 "모션 이벤트"로만: 조준 중에 검지를 위로 확 올리는 순간만 1프레임 true
-    const now = performance.now();
-    const prev = gestureRef.current.prevIndex;
-    const cur = { y: indexTip.y, t: now };
-    // 조준이 순간 끊겨도(프레임 드랍/손 가림) 220ms 정도는 발사 모션 판정을 유지
-    const aimGrace = now - gestureRef.current.lastAimAt < 220;
-    const flickUp = aimGrace && isIndexFlickUpShot(prev, cur);
-    crosshair.shootGestureActive = flickUp;
-    // prevIndex를 매 프레임 갱신하면 dtMs가 ~16ms(60fps)라 항상 < 45ms 조건에 걸림
-    // 60ms 이상 간격으로만 갱신해서 의미 있는 이동량 비교가 가능하게 함
-    if (!prev || now - prev.t >= 60) {
-      gestureRef.current.prevIndex = cur;
-    }
+    // 슈팅 감지 (히스토리 기반 다중 방법)
+    crosshair.shootGestureActive = detectShootGesture(
+      history,
+      lastAimAtRef.current,
+    );
   }
+
+  // ─── MediaPipe setup ─────────────────────────────────
 
   async function setupHandLandmarker() {
     const wasmPath = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_TASKS_VERSION}/wasm`;
@@ -345,10 +623,10 @@ export function MotionShooterGame() {
     }
   }
 
+  // ─── Game logic ──────────────────────────────────────
+
   function spawnFruit(w: number) {
     const kind = pick(fruitKinds);
-    // "진짜 크게" 보이려면 캔버스 폭에 비례해 스케일을 잡아야 함.
-    // size는 픽셀 스프라이트 스케일링에 쓰이고, 실제 렌더 폭/높이로 스폰 경계를 계산한다.
     const minSize = Math.max(150, w * 0.24);
     const maxSize = Math.max(minSize + 1, Math.max(210, w * 0.34));
     const size = rand(minSize, maxSize);
@@ -360,92 +638,154 @@ export function MotionShooterGame() {
     const halfW = renderW / 2;
     const halfH = renderH / 2;
 
-    // 렌더 폭이 화면보다 커도 중앙 스폰해서 "거대"하게 보이게
-    const x =
-      renderW >= w ? w / 2 : rand(halfW, Math.max(halfW + 1, w - halfW));
+    const x = renderW >= w ? w / 2 : rand(halfW, Math.max(halfW + 1, w - halfW));
     const y = -halfH - rand(0, 120);
-    const vy = rand(28, 46);
-    const vx = rand(-5, 5);
+    const vy = rand(30, 50);
+    const vx = rand(-8, 8);
     fruitsRef.current.push({
-      id: uid("fruit"),
+      id: uid("f"),
       kind,
       pos: { x, y },
       vel: { x: vx, y: vy },
       size,
       rotation: rand(0, Math.PI * 2),
-      spin: rand(-2.4, 2.4),
+      spin: rand(-2.8, 2.8),
+      spawnedAt: performance.now(),
     });
   }
 
-  function explode(at: Vec2, baseColor: string) {
+  function explode(at: Vec2, baseColor: string, big: boolean) {
     const now = performance.now();
-    const n = Math.floor(rand(18, 28));
+    const n = big ? Math.floor(rand(30, 45)) : Math.floor(rand(10, 18));
     for (let i = 0; i < n; i++) {
       const a = rand(0, Math.PI * 2);
-      const sp = rand(120, 520);
-      const tint = i % 3 === 0 ? "#ffffff" : baseColor;
+      const sp = big ? rand(160, 640) : rand(80, 320);
+      const colors = ["#ffffff", baseColor, baseColor, baseColor, "#fbbf24"];
       particlesRef.current.push({
         id: uid("p"),
         pos: { x: at.x, y: at.y },
         vel: { x: Math.cos(a) * sp, y: Math.sin(a) * sp },
-        lifeMs: rand(420, 860),
+        lifeMs: rand(400, big ? 1100 : 600),
         bornAt: now,
-        size: rand(2, 6),
-        color: tint,
+        size: rand(big ? 2 : 1.5, big ? 7 : 4),
+        color: pick(colors),
+        glow: i % 4 === 0,
       });
     }
+  }
+
+  function addScorePopup(pos: Vec2, value: number, comboCount: number) {
+    popupsRef.current.push({
+      id: uid("sp"),
+      pos: { ...pos },
+      value,
+      combo: comboCount,
+      bornAt: performance.now(),
+    });
+  }
+
+  function triggerShake(intensity: number) {
+    shakeRef.current = {
+      intensity,
+      startAt: performance.now(),
+      durationMs: SHAKE_MS,
+    };
+  }
+
+  function triggerMuzzle(pos: Vec2) {
+    muzzleRef.current = {
+      pos: { ...pos },
+      startAt: performance.now(),
+    };
   }
 
   function tryShoot(canvasW: number, canvasH: number) {
     const now = performance.now();
     const crosshair = crosshairRef.current;
     if (!crosshair.shootGestureActive) return;
-    if (crosshair.confidence < 0.2) return;
+    if (crosshair.confidence < 0.18) return;
     if (now - crosshair.lastShotAt < SHOT_COOLDOWN_MS) return;
     crosshair.lastShotAt = now;
     crosshair.shootGestureActive = false;
 
-    const aim = { x: crosshair.pos.x * canvasW, y: crosshair.pos.y * canvasH };
+    const audio = audioRef.current;
+    audio?.shoot();
+
+    const aim = { x: crosshair.smoothPos.x * canvasW, y: crosshair.smoothPos.y * canvasH };
+    triggerMuzzle(aim);
 
     let hits = 0;
     const remaining: Fruit[] = [];
     for (const f of fruitsRef.current) {
       if (dist(f.pos, aim) <= HIT_RADIUS_PX + f.size * 0.42) {
         hits++;
-        const { palette } = FRUIT_SPRITES[f.kind];
-        const baseColor = palette["r"] || palette["y"] || palette["p"] || palette["g"] || "#60a5fa";
-        explode(f.pos, baseColor);
+        const color = fruitBaseColor(f.kind);
+        explode(f.pos, color, true);
       } else {
         remaining.push(f);
       }
     }
-    if (hits > 0) setScore((s) => s + hits * 10);
     fruitsRef.current = remaining;
 
-    // Extra muzzle burst at aim point
-    explode(aim, "#60a5fa");
+    if (hits > 0) {
+      const c = comboRef.current;
+      if (now - c.lastHitAt < COMBO_WINDOW_MS) {
+        c.count += hits;
+      } else {
+        c.count = hits;
+      }
+      c.lastHitAt = now;
+
+      const multiplier = Math.max(1, c.count);
+      const points = hits * 10 * multiplier;
+      setScore((s) => s + points);
+      setCombo(c.count);
+      addScorePopup(aim, points, c.count);
+
+      audio?.hit();
+      if (c.count >= 2) audio?.combo(c.count);
+
+      triggerShake(Math.min(12, 4 + c.count * 2));
+    } else {
+      audio?.miss();
+      // 작은 머즐 파티클만
+      explode(aim, "#60a5fa", false);
+    }
   }
 
-  function draw(ctx: CanvasRenderingContext2D, w: number, h: number) {
-    ctx.clearRect(0, 0, w, h);
+  // ─── Draw ────────────────────────────────────────────
 
-    // Background video (subtle)
+  function draw(ctx: CanvasRenderingContext2D, w: number, h: number, timeLeft: number) {
+    const now = performance.now();
+
+    // Screen shake offset
+    let shakeX = 0;
+    let shakeY = 0;
+    const shake = shakeRef.current;
+    if (shake && now - shake.startAt < shake.durationMs) {
+      const t = 1 - (now - shake.startAt) / shake.durationMs;
+      shakeX = (Math.random() - 0.5) * shake.intensity * t * 2;
+      shakeY = (Math.random() - 0.5) * shake.intensity * t * 2;
+    }
+
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+
+    ctx.clearRect(-20, -20, w + 40, h + 40);
+
+    // ── Background ──
     const video = videoRef.current;
     if (video && video.readyState >= 2) {
       ctx.save();
-      ctx.globalAlpha = 0.22;
-      // mirror video to match aiming
+      ctx.globalAlpha = 0.2;
       ctx.translate(w, 0);
       ctx.scale(-1, 1);
       const scale = Math.max(w / video.videoWidth, h / video.videoHeight);
       const dw = video.videoWidth * scale;
       const dh = video.videoHeight * scale;
-      const dx = (w - dw) / 2;
-      const dy = (h - dh) / 2;
-      ctx.drawImage(video, dx, dy, dw, dh);
+      ctx.drawImage(video, (w - dw) / 2, (h - dh) / 2, dw, dh);
       ctx.restore();
     } else {
-      // fallback gradient
       const g = ctx.createLinearGradient(0, 0, 0, h);
       g.addColorStop(0, "#0b1020");
       g.addColorStop(1, "#05060a");
@@ -454,76 +794,229 @@ export function MotionShooterGame() {
     }
 
     // Vignette
-    ctx.save();
     const vg = ctx.createRadialGradient(w * 0.5, h * 0.45, 40, w * 0.5, h * 0.45, Math.max(w, h));
     vg.addColorStop(0, "rgba(0,0,0,0)");
-    vg.addColorStop(1, "rgba(0,0,0,0.7)");
+    vg.addColorStop(1, "rgba(0,0,0,0.75)");
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, w, h);
-    ctx.restore();
 
-    // Fruits
+    // ── Star field ──
+    for (const s of starsRef.current) {
+      const twinkle = 0.5 + 0.5 * Math.sin(now * 0.002 + s.twinkleOffset);
+      ctx.save();
+      ctx.globalAlpha = s.alpha * twinkle;
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.arc(s.x * w, s.y * h, s.size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    // Drift stars down slowly
+    for (const s of starsRef.current) {
+      s.y += s.speed * 0.016;
+      if (s.y > 1.05) {
+        s.y = -0.05;
+        s.x = Math.random();
+      }
+    }
+
+    // ── Urgency vignette (last 10 seconds) ──
+    const timeLeftSec = timeLeft / 1000;
+    if (timeLeftSec <= URGENCY_THRESHOLD_S && timeLeftSec > 0) {
+      const urgency = 1 - timeLeftSec / URGENCY_THRESHOLD_S;
+      const pulse = 0.5 + 0.5 * Math.sin(now * 0.006 * (1 + urgency * 3));
+      ctx.save();
+      ctx.globalAlpha = urgency * 0.35 * pulse;
+      const ug = ctx.createRadialGradient(w * 0.5, h * 0.5, w * 0.2, w * 0.5, h * 0.5, w * 0.8);
+      ug.addColorStop(0, "transparent");
+      ug.addColorStop(1, "#ef4444");
+      ctx.fillStyle = ug;
+      ctx.fillRect(0, 0, w, h);
+      ctx.restore();
+    }
+
+    // ── Fruits ──
     for (const f of fruitsRef.current) {
       const { sprite, palette } = FRUIT_SPRITES[f.kind];
       const pixel = Math.max(2, Math.floor(f.size / 12));
       const spriteW = sprite[0]!.length * pixel;
       const spriteH = sprite.length * pixel;
+      const age = now - f.spawnedAt;
+      const pulse = 1 + 0.03 * Math.sin(age * 0.005);
 
       ctx.save();
       ctx.translate(f.pos.x, f.pos.y);
       ctx.rotate(f.rotation);
-      ctx.shadowColor = "rgba(0,0,0,0.35)";
-      ctx.shadowBlur = 12;
+      ctx.scale(pulse, pulse);
+
+      // Glow
+      ctx.shadowColor = fruitBaseColor(f.kind);
+      ctx.shadowBlur = 20 + 6 * Math.sin(age * 0.004);
       drawPixelSprite(ctx, sprite, palette, -spriteW / 2, -spriteH / 2, pixel);
+
+      // Reset shadow and draw again on top for crisp look
+      ctx.shadowColor = "transparent";
+      ctx.shadowBlur = 0;
+      drawPixelSprite(ctx, sprite, palette, -spriteW / 2, -spriteH / 2, pixel);
+
       ctx.restore();
     }
 
-    // Particles
-    const now = performance.now();
+    // ── Particles ──
     for (const p of particlesRef.current) {
       const t = clamp01((now - p.bornAt) / p.lifeMs);
       const a = 1 - t;
       ctx.save();
       ctx.globalAlpha = a;
+      if (p.glow) {
+        ctx.shadowColor = p.color;
+        ctx.shadowBlur = 12;
+      }
       ctx.fillStyle = p.color;
       ctx.beginPath();
-      ctx.arc(p.pos.x, p.pos.y, p.size, 0, Math.PI * 2);
+      ctx.arc(p.pos.x, p.pos.y, p.size * (1 - t * 0.5), 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
     }
 
-    // Crosshair
-    const crosshair = crosshairRef.current;
-    if (crosshair.confidence > 0.12) {
-      const x = crosshair.pos.x * w;
-      const y = crosshair.pos.y * h;
-      const r = crosshair.shootGestureActive ? 14 : crosshair.aimPoseActive ? 18 : 22;
+    // ── Muzzle flash ──
+    const muzzle = muzzleRef.current;
+    if (muzzle && now - muzzle.startAt < MUZZLE_MS) {
+      const t = (now - muzzle.startAt) / MUZZLE_MS;
+      const radius = 60 + t * 40;
       ctx.save();
-      ctx.globalAlpha = 0.95;
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = crosshair.shootGestureActive
+      ctx.globalAlpha = (1 - t) * 0.7;
+      const mg = ctx.createRadialGradient(
+        muzzle.pos.x, muzzle.pos.y, 0,
+        muzzle.pos.x, muzzle.pos.y, radius,
+      );
+      mg.addColorStop(0, "#ffffff");
+      mg.addColorStop(0.3, "#fbbf24");
+      mg.addColorStop(1, "transparent");
+      ctx.fillStyle = mg;
+      ctx.fillRect(
+        muzzle.pos.x - radius,
+        muzzle.pos.y - radius,
+        radius * 2,
+        radius * 2,
+      );
+      ctx.restore();
+    }
+
+    // ── Score popups ──
+    for (const sp of popupsRef.current) {
+      const t = clamp01((now - sp.bornAt) / POPUP_MS);
+      const easeOut = 1 - (1 - t) * (1 - t);
+      const y = sp.pos.y - easeOut * 80;
+      const alpha = 1 - t;
+      const scale = 1 + (sp.combo > 1 ? 0.3 : 0);
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.font = `bold ${Math.floor(22 * scale)}px system-ui, sans-serif`;
+      ctx.textAlign = "center";
+
+      // Shadow text
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fillText(`+${sp.value}`, sp.pos.x + 2, y + 2);
+
+      // Main text
+      ctx.fillStyle = sp.combo > 1 ? "#fbbf24" : "#ffffff";
+      ctx.shadowColor = sp.combo > 1 ? "#fbbf24" : "#60a5fa";
+      ctx.shadowBlur = 10;
+      ctx.fillText(`+${sp.value}`, sp.pos.x, y);
+
+      // Combo label
+      if (sp.combo > 1) {
+        ctx.font = `bold ${Math.floor(15 * scale)}px system-ui, sans-serif`;
+        ctx.fillStyle = "#fb923c";
+        ctx.fillText(`COMBO x${sp.combo}`, sp.pos.x, y + 22);
+      }
+      ctx.restore();
+    }
+
+    // ── Crosshair ──
+    const crosshair = crosshairRef.current;
+    if (crosshair.confidence > 0.1) {
+      const cx = crosshair.smoothPos.x * w;
+      const cy = crosshair.smoothPos.y * h;
+
+      // Trail
+      const trail = crosshair.trail;
+      for (let i = 0; i < trail.length; i++) {
+        const tt = i / trail.length;
+        ctx.save();
+        ctx.globalAlpha = tt * 0.3;
+        ctx.fillStyle = crosshair.aimPoseActive ? "#60a5fa" : "#94a3b8";
+        ctx.beginPath();
+        ctx.arc(trail[i]!.x * w, trail[i]!.y * h, 3 + tt * 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Main crosshair
+      const isShot = now - crosshair.lastShotAt < 100;
+      const r = isShot ? 12 : crosshair.aimPoseActive ? 18 : 22;
+      const color = isShot
         ? "#fbbf24"
         : crosshair.aimPoseActive
           ? "#60a5fa"
-          : "rgba(148,163,184,0.7)";
-      ctx.shadowColor = ctx.strokeStyle;
-      ctx.shadowBlur = 10;
+          : "rgba(148,163,184,0.6)";
+      const rotation = now * 0.001;
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(rotation);
+
+      // Outer ring
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = isShot ? 20 : 10;
       ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
       ctx.stroke();
+
+      // Inner dot
+      ctx.fillStyle = color;
       ctx.beginPath();
-      ctx.moveTo(x - r - 6, y);
-      ctx.lineTo(x - r + 2, y);
-      ctx.moveTo(x + r - 2, y);
-      ctx.lineTo(x + r + 6, y);
-      ctx.moveTo(x, y - r - 6);
-      ctx.lineTo(x, y - r + 2);
-      ctx.moveTo(x, y + r - 2);
-      ctx.lineTo(x, y + r + 6);
+      ctx.arc(0, 0, isShot ? 4 : 2.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Cross lines (rotating)
+      ctx.beginPath();
+      const len = r + 8;
+      const gap = r - 3;
+      for (let i = 0; i < 4; i++) {
+        const angle = (i * Math.PI) / 2;
+        ctx.moveTo(Math.cos(angle) * gap, Math.sin(angle) * gap);
+        ctx.lineTo(Math.cos(angle) * len, Math.sin(angle) * len);
+      }
       ctx.stroke();
+
       ctx.restore();
     }
+
+    // ── Canvas Combo HUD (bottom center) ──
+    const c = comboRef.current;
+    if (c.count > 1 && now - c.lastHitAt < COMBO_WINDOW_MS) {
+      const fade = clamp01(1 - (now - c.lastHitAt) / COMBO_WINDOW_MS);
+      const pulse = 1 + 0.08 * Math.sin(now * 0.012);
+      ctx.save();
+      ctx.globalAlpha = fade;
+      ctx.textAlign = "center";
+      ctx.font = `bold ${Math.floor(36 * pulse)}px system-ui, sans-serif`;
+      ctx.fillStyle = "#fbbf24";
+      ctx.shadowColor = "#f97316";
+      ctx.shadowBlur = 20;
+      ctx.fillText(`COMBO x${c.count}`, w / 2, h * 0.48);
+      ctx.restore();
+    }
+
+    ctx.restore(); // end shake transform
   }
+
+  // ─── Game loop ───────────────────────────────────────
 
   function step() {
     const canvas = canvasRef.current;
@@ -539,53 +1032,85 @@ export function MotionShooterGame() {
     const dt = Math.min(0.05, (now - lastFrameAtRef.current) / 1000);
     lastFrameAtRef.current = now;
 
+    // Hand detection
     const video = videoRef.current;
     const landmarker = handLandmarkerRef.current;
     if (runningRef.current && landmarker && video && video.readyState >= 2) {
       applyHandResult(landmarker.detectForVideo(video, now));
     }
 
+    // Smooth crosshair (lerp)
+    const crosshair = crosshairRef.current;
+    crosshair.smoothPos = {
+      x: lerp(crosshair.smoothPos.x, crosshair.pos.x, 0.28),
+      y: lerp(crosshair.smoothPos.y, crosshair.pos.y, 0.28),
+    };
+    // Trail
+    crosshair.trail.push({ ...crosshair.smoothPos });
+    while (crosshair.trail.length > TRAIL_LEN) crosshair.trail.shift();
+
+    // HUD update (throttled)
     hudFrameRef.current += 1;
     if (hudFrameRef.current % HUD_FRAME_INTERVAL === 0) {
       setHandTracked(lastHandOkRef.current);
     }
 
     // Timer
+    let currentTimeLeft = GAME_MS;
     setTimeLeftMs((ms) => {
       if (!runningRef.current) return ms;
       const next = Math.max(0, ms - dt * 1000);
+      currentTimeLeft = next;
       if (next <= 0 && status === "running") {
         runningRef.current = false;
         setStatus("ended");
+        audioRef.current?.gameEnd();
       }
       return next;
     });
 
-    // Spawn fruits
+    // Countdown tick sound (last 5 seconds)
+    const secLeft = Math.ceil(currentTimeLeft / 1000);
+    if (secLeft <= 5 && secLeft > 0 && secLeft !== lastTickSecRef.current) {
+      lastTickSecRef.current = secLeft;
+      audioRef.current?.tick();
+    }
+
+    // Combo decay
+    const c = comboRef.current;
+    if (c.count > 0 && now - c.lastHitAt > COMBO_WINDOW_MS) {
+      c.count = 0;
+      setCombo(0);
+    }
+
+    // Spawn fruits — faster as time runs out
+    const urgencyBoost = currentTimeLeft < URGENCY_THRESHOLD_S * 1000
+      ? 1 + (1 - currentTimeLeft / (URGENCY_THRESHOLD_S * 1000)) * 0.6
+      : 1;
+    const spawnInterval = rand(900, 1600) / urgencyBoost;
     if (
       runningRef.current &&
       fruitsRef.current.length < MAX_FRUITS_ON_SCREEN &&
-      now - lastSpawnAtRef.current > rand(1200, 1900)
+      now - lastSpawnAtRef.current > spawnInterval
     ) {
       lastSpawnAtRef.current = now;
       spawnFruit(w);
     }
 
     // Update fruits
-    const gravity = 38;
+    const gravity = 40;
     const nextFruits: Fruit[] = [];
     for (const f of fruitsRef.current) {
       const pos = { x: f.pos.x + f.vel.x * dt, y: f.pos.y + f.vel.y * dt };
       const vel = { x: f.vel.x * 0.999, y: f.vel.y + gravity * dt };
       const rotation = f.rotation + f.spin * dt;
-
-      // Cull below screen
       if (pos.y < h + f.size + 80) {
         nextFruits.push({ ...f, pos, vel, rotation });
       }
     }
     fruitsRef.current = nextFruits;
 
+    // Shoot
     if (runningRef.current) tryShoot(w, h);
 
     // Update particles
@@ -593,35 +1118,53 @@ export function MotionShooterGame() {
       .map((p) => ({
         ...p,
         pos: { x: p.pos.x + p.vel.x * dt, y: p.pos.y + p.vel.y * dt },
-        vel: { x: p.vel.x * 0.98, y: p.vel.y * 0.98 + 240 * dt },
+        vel: { x: p.vel.x * 0.97, y: p.vel.y * 0.97 + 280 * dt },
       }))
       .filter((p) => now - p.bornAt < p.lifeMs);
 
-    draw(ctx, w, h);
+    // Cleanup popups
+    popupsRef.current = popupsRef.current.filter((sp) => now - sp.bornAt < POPUP_MS);
+
+    draw(ctx, w, h, currentTimeLeft);
 
     if (runningRef.current) {
       rafRef.current = requestAnimationFrame(step);
     }
   }
 
+  // ─── Start / Reset ──────────────────────────────────
+
   async function start() {
     if (!ready) return;
     if (status === "requesting_camera" || status === "running") return;
+
+    // Init audio
+    if (!audioRef.current) audioRef.current = new GameAudio();
 
     setErrorMsg(null);
     setHandTracked(false);
     lastHandOkRef.current = false;
     setScore(0);
+    setCombo(0);
     setTimeLeftMs(GAME_MS);
     fruitsRef.current = [];
     particlesRef.current = [];
-    gestureRef.current = { prevIndex: null, lastAimAt: 0 };
+    popupsRef.current = [];
+    gestureHistoryRef.current = [];
+    lastAimAtRef.current = 0;
+    comboRef.current = { count: 0, lastHitAt: 0 };
+    lastTickSecRef.current = -1;
+    shakeRef.current = null;
+    muzzleRef.current = null;
+    starsRef.current = createStars(STAR_COUNT);
     crosshairRef.current = {
       pos: { x: 0.5, y: 0.6 },
+      smoothPos: { x: 0.5, y: 0.6 },
       aimPoseActive: false,
       shootGestureActive: false,
       lastShotAt: 0,
       confidence: 0,
+      trail: [],
     };
 
     setStatus("requesting_camera");
@@ -641,9 +1184,13 @@ export function MotionShooterGame() {
       await video.play();
 
       runningRef.current = true;
-      lastFrameAtRef.current = performance.now();
-      lastSpawnAtRef.current = performance.now();
+      const now = performance.now();
+      lastFrameAtRef.current = now;
+      lastSpawnAtRef.current = now;
+      gameStartAtRef.current = now;
       setStatus("running");
+
+      audioRef.current?.gameStart();
 
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       rafRef.current = requestAnimationFrame(step);
@@ -667,19 +1214,25 @@ export function MotionShooterGame() {
     lastHandOkRef.current = false;
     setTimeLeftMs(GAME_MS);
     setScore(0);
+    setCombo(0);
     fruitsRef.current = [];
     particlesRef.current = [];
-    gestureRef.current = { prevIndex: null, lastAimAt: 0 };
+    popupsRef.current = [];
+    gestureHistoryRef.current = [];
+    comboRef.current = { count: 0, lastHitAt: 0 };
     crosshairRef.current = {
       pos: { x: 0.5, y: 0.6 },
+      smoothPos: { x: 0.5, y: 0.6 },
       aimPoseActive: false,
       shootGestureActive: false,
       lastShotAt: 0,
       confidence: 0,
+      trail: [],
     };
   }
 
   const timeLeftSec = Math.ceil(timeLeftMs / 1000);
+  const isUrgent = status === "running" && timeLeftSec <= URGENCY_THRESHOLD_S;
 
   return (
     <div className="relative h-dvh w-full overflow-hidden font-sans antialiased text-white">
@@ -701,6 +1254,7 @@ export function MotionShooterGame() {
         className="pointer-events-none fixed top-0 left-0 h-px w-px opacity-0"
       />
 
+      {/* ── HUD Top ── */}
       <div className="pointer-events-none absolute inset-x-0 top-0 z-10 p-3 sm:p-5">
         <div className="mx-auto flex max-w-5xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-wrap items-center gap-3">
@@ -713,7 +1267,7 @@ export function MotionShooterGame() {
 
             {status === "running" ? (
               <div
-                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium backdrop-blur-md ${
+                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium backdrop-blur-md transition-colors ${
                   handTracked
                     ? "border-emerald-400/30 bg-emerald-950/40 text-emerald-200"
                     : "border-amber-400/25 bg-amber-950/35 text-amber-100"
@@ -728,32 +1282,55 @@ export function MotionShooterGame() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+            {/* Combo badge */}
+            {combo > 1 && status === "running" ? (
+              <div className="animate-bounce rounded-2xl border border-amber-400/30 bg-amber-950/50 px-4 py-2 text-sm backdrop-blur-xl">
+                <span className="font-bold text-amber-300">COMBO x{combo}</span>
+              </div>
+            ) : null}
+
             <div className="rounded-2xl border border-white/10 bg-zinc-950/50 px-4 py-2 text-sm backdrop-blur-xl">
               <span className="text-zinc-400">점수</span>{" "}
               <span className="font-semibold tabular-nums text-white">{score}</span>
             </div>
-            <div className="rounded-2xl border border-cyan-500/20 bg-linear-to-br from-cyan-950/40 to-zinc-950/50 px-4 py-2 text-sm backdrop-blur-xl">
-              <span className="text-cyan-200/80">남은 시간</span>{" "}
-              <span className="font-semibold tabular-nums text-white">{timeLeftSec}s</span>
+            <div
+              className={`rounded-2xl border px-4 py-2 text-sm backdrop-blur-xl transition-all ${
+                isUrgent
+                  ? "animate-pulse border-red-500/40 bg-red-950/40"
+                  : "border-cyan-500/20 bg-linear-to-br from-cyan-950/40 to-zinc-950/50"
+              }`}
+            >
+              <span className={isUrgent ? "text-red-300" : "text-cyan-200/80"}>남은 시간</span>{" "}
+              <span className={`font-semibold tabular-nums ${isUrgent ? "text-red-100" : "text-white"}`}>
+                {timeLeftSec}s
+              </span>
             </div>
           </div>
         </div>
       </div>
 
+      {/* ── Bottom HUD ── */}
       <div className="absolute inset-x-0 bottom-0 z-30 p-3 sm:p-5">
         <div className="mx-auto flex max-w-5xl flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div className="max-w-xl rounded-2xl border border-white/10 bg-zinc-950/50 p-4 text-sm leading-relaxed text-zinc-300 shadow-lg backdrop-blur-xl">
-            <div className="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">조작</div>
+            <div className="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">
+              조작법
+            </div>
             <p>
-              <span className="font-medium text-cyan-200">조준:</span> 검지를 펴서 가리키기{" "}
-              <span className="text-zinc-500">(손바닥 완전 펼침은 제외)</span>
+              <span className="font-medium text-cyan-200">조준:</span> 검지를 펴서 가리키기
             </p>
             <p className="mt-1">
-              <span className="font-medium text-amber-200">발사:</span> 손총 자세로 잠깐 잡기 — 검지는 위로, 나머지는 접기,
-              손을 화면 위쪽으로, 엄지는 검지에서 떼기. 한 번 쏘면 자세를 풀었다가 다시 잡아야 합니다.
+              <span className="font-medium text-amber-200">발사:</span> 조준 상태에서 손을 아래로
+              빠르게 톡 치기, 또는 엄지로 검지 아래쪽 톡 누르기
+            </p>
+            <p className="mt-1">
+              <span className="font-medium text-fuchsia-200">콤보:</span> 빠르게 연속 명중하면
+              콤보 배율 UP!
             </p>
             {errorMsg ? (
-              <p className="mt-3 rounded-lg border border-red-500/30 bg-red-950/40 px-3 py-2 text-red-200">{errorMsg}</p>
+              <p className="mt-3 rounded-lg border border-red-500/30 bg-red-950/40 px-3 py-2 text-red-200">
+                {errorMsg}
+              </p>
             ) : null}
           </div>
 
@@ -784,11 +1361,14 @@ export function MotionShooterGame() {
         </div>
       </div>
 
+      {/* ── Game Over overlay ── */}
       {status === "ended" ? (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center p-6">
           <div className="w-full max-w-md rounded-3xl border border-white/15 bg-zinc-950/75 p-8 text-center shadow-2xl shadow-violet-500/20 backdrop-blur-2xl">
-            <div className="text-sm font-medium uppercase tracking-[0.2em] text-zinc-500">라운드 종료</div>
-            <div className="mt-2 text-3xl font-bold tracking-tight text-white">수고했어요</div>
+            <div className="text-sm font-medium uppercase tracking-[0.2em] text-zinc-500">
+              라운드 종료
+            </div>
+            <div className="mt-2 text-3xl font-bold tracking-tight text-white">수고했어요!</div>
             <div className="mt-6 text-sm text-zinc-400">최종 점수</div>
             <div className="mt-1 bg-linear-to-r from-violet-200 to-cyan-200 bg-clip-text text-5xl font-bold tabular-nums text-transparent">
               {score}
@@ -802,4 +1382,3 @@ export function MotionShooterGame() {
     </div>
   );
 }
-

@@ -34,7 +34,7 @@ type Particle = {
 type Crosshair = {
   pos: Vec2;
   aimPoseActive: boolean;
-  shootPoseActive: boolean;
+  shootGestureActive: boolean;
   lastShotAt: number;
   confidence: number; // 0..1
 };
@@ -88,60 +88,25 @@ function fingerExtendedFromWrist(
   return lmDist(lm[tipIdx]!, lm[wristIdx]!) > lmDist(lm[pipIdx]!, lm[wristIdx]!) * ratio;
 }
 
-/** 손목 기준으로 손가락이 접혔는지(건 자세의 중지/약지/소지) */
-function fingerCurledTowardWrist(
-  lm: HandLm[],
-  tipIdx: number,
-  pipIdx: number,
-  wristIdx = 0,
-  ratio = 1.09,
-) {
-  return lmDist(lm[tipIdx]!, lm[wristIdx]!) < lmDist(lm[pipIdx]!, lm[wristIdx]!) * ratio;
-}
-
-/** 조준: 검지 펴기(살짝 느슨) + 손바닥 완전 펼침은 제외 */
+/** 조준: 오직 검지(손목 기준)만 사용 */
 function isAimPose(lm: HandLm[]) {
   if (lm.length < 21) return false;
-  const indexExtended = fingerExtendedFromWrist(lm, 8, 6, 0, 1.07);
-  if (!indexExtended) return false;
-  const middleExtended = fingerExtendedFromWrist(lm, 12, 10, 0, 1.1);
-  const ringExtended = fingerExtendedFromWrist(lm, 16, 14, 0, 1.1);
-  const pinkyExtended = fingerExtendedFromWrist(lm, 20, 18, 0, 1.1);
-  if (middleExtended && ringExtended && pinkyExtended) return false;
-  return true;
+  return fingerExtendedFromWrist(lm, 8, 6, 0, 1.06);
 }
 
-/**
- * 검지만 펴서 조준 + 나머지 접기 + 총구를 위로(화면 위쪽) + 손을 화면 위쪽으로 든 자세
- */
-function isGunHandsUpShotPose(lm: HandLm[]) {
-  if (lm.length < 21) return false;
-
-  const wrist = lm[0]!;
-  const indexTip = lm[8]!;
-  const thumbTip = lm[4]!;
-
-  const indexAim = fingerExtendedFromWrist(lm, 8, 6, 0, 1.07);
-  const middleCurled = fingerCurledTowardWrist(lm, 12, 10, 0);
-  const ringCurled = fingerCurledTowardWrist(lm, 16, 14, 0);
-  const pinkyCurled = fingerCurledTowardWrist(lm, 20, 18, 0);
-
-  const barrelPointsUp = indexTip.y < wrist.y - 0.022;
-  const handRaisedHigh = wrist.y < 0.72;
-  const thumbSpread = lmDist(thumbTip, indexTip) > 0.052;
-  const thumbHammerish =
-    fingerExtendedFromWrist(lm, 4, 3, 0, 1.06) || thumbTip.y < lm[3]!.y - 0.012;
-
-  return (
-    indexAim &&
-    middleCurled &&
-    ringCurled &&
-    pinkyCurled &&
-    barrelPointsUp &&
-    handRaisedHigh &&
-    thumbSpread &&
-    thumbHammerish
-  );
+/** 발사: "검지를 위로 확 들어올리는" 모션(짧은 시간 내 y가 크게 감소) */
+function isIndexFlickUpShot(
+  prev: { y: number; t: number } | null,
+  cur: { y: number; t: number },
+) {
+  if (!prev) return false;
+  const dtMs = Math.max(1, cur.t - prev.t);
+  // 너무 짧거나 너무 길면 노이즈/일반 이동
+  if (dtMs < 45 || dtMs > 320) return false;
+  const dy = prev.y - cur.y; // 위로 가면 +dy (y는 위쪽이 작음)
+  const speed = dy / dtMs; // normalized per ms
+  // 충분히 "확" 올라가는 모션만
+  return dy > 0.032 && speed > 0.00018;
 }
 
 function drawPixelSprite(
@@ -253,11 +218,14 @@ export function MotionShooterGame() {
   const particlesRef = useRef<Particle[]>([]);
   const lastHandOkRef = useRef(false);
   const hudFrameRef = useRef(0);
-  const gestureRef = useRef({ prevShootPose: false });
+  const gestureRef = useRef({
+    prevIndex: null as { y: number; t: number } | null,
+    lastAimAt: 0,
+  });
   const crosshairRef = useRef<Crosshair>({
     pos: { x: 0.5, y: 0.6 },
     aimPoseActive: false,
-    shootPoseActive: false,
+    shootGestureActive: false,
     lastShotAt: 0,
     confidence: 0,
   });
@@ -314,7 +282,7 @@ export function MotionShooterGame() {
       lastHandOkRef.current = false;
       crosshair.confidence = Math.max(0, crosshair.confidence - 0.1);
       crosshair.aimPoseActive = false;
-      crosshair.shootPoseActive = false;
+      crosshair.shootGestureActive = false;
       return;
     }
 
@@ -322,6 +290,7 @@ export function MotionShooterGame() {
 
     const indexTip = landmarks[8]!;
     const aimPose = isAimPose(landmarks);
+    if (aimPose) gestureRef.current.lastAimAt = performance.now();
 
     crosshair.aimPoseActive = aimPose;
 
@@ -334,8 +303,19 @@ export function MotionShooterGame() {
       crosshair.confidence = Math.max(0, crosshair.confidence - 0.12);
     }
 
-    // 발사 자세는 "조준 자세"를 포함하지만 훨씬 더 엄격하게
-    crosshair.shootPoseActive = aimPose && isGunHandsUpShotPose(landmarks);
+    // 발사는 "모션 이벤트"로만: 조준 중에 검지를 위로 확 올리는 순간만 1프레임 true
+    const now = performance.now();
+    const prev = gestureRef.current.prevIndex;
+    const cur = { y: indexTip.y, t: now };
+    // 조준이 순간 끊겨도(프레임 드랍/손 가림) 220ms 정도는 발사 모션 판정을 유지
+    const aimGrace = now - gestureRef.current.lastAimAt < 220;
+    const flickUp = aimGrace && isIndexFlickUpShot(prev, cur);
+    crosshair.shootGestureActive = flickUp;
+    // prevIndex를 매 프레임 갱신하면 dtMs가 ~16ms(60fps)라 항상 < 45ms 조건에 걸림
+    // 60ms 이상 간격으로만 갱신해서 의미 있는 이동량 비교가 가능하게 함
+    if (!prev || now - prev.t >= 60) {
+      gestureRef.current.prevIndex = cur;
+    }
   }
 
   async function setupHandLandmarker() {
@@ -419,16 +399,11 @@ export function MotionShooterGame() {
   function tryShoot(canvasW: number, canvasH: number) {
     const now = performance.now();
     const crosshair = crosshairRef.current;
-    const gesture = gestureRef.current;
-
-    const shootPose = crosshair.shootPoseActive;
-    const risingEdge = shootPose && !gesture.prevShootPose;
-    gesture.prevShootPose = shootPose;
-
-    if (!risingEdge) return;
+    if (!crosshair.shootGestureActive) return;
     if (crosshair.confidence < 0.2) return;
     if (now - crosshair.lastShotAt < SHOT_COOLDOWN_MS) return;
     crosshair.lastShotAt = now;
+    crosshair.shootGestureActive = false;
 
     const aim = { x: crosshair.pos.x * canvasW, y: crosshair.pos.y * canvasH };
 
@@ -522,11 +497,11 @@ export function MotionShooterGame() {
     if (crosshair.confidence > 0.12) {
       const x = crosshair.pos.x * w;
       const y = crosshair.pos.y * h;
-      const r = crosshair.shootPoseActive ? 14 : crosshair.aimPoseActive ? 18 : 22;
+      const r = crosshair.shootGestureActive ? 14 : crosshair.aimPoseActive ? 18 : 22;
       ctx.save();
       ctx.globalAlpha = 0.95;
       ctx.lineWidth = 2;
-      ctx.strokeStyle = crosshair.shootPoseActive
+      ctx.strokeStyle = crosshair.shootGestureActive
         ? "#fbbf24"
         : crosshair.aimPoseActive
           ? "#60a5fa"
@@ -640,11 +615,11 @@ export function MotionShooterGame() {
     setTimeLeftMs(GAME_MS);
     fruitsRef.current = [];
     particlesRef.current = [];
-    gestureRef.current = { prevShootPose: false };
+    gestureRef.current = { prevIndex: null, lastAimAt: 0 };
     crosshairRef.current = {
       pos: { x: 0.5, y: 0.6 },
       aimPoseActive: false,
-      shootPoseActive: false,
+      shootGestureActive: false,
       lastShotAt: 0,
       confidence: 0,
     };
@@ -694,11 +669,11 @@ export function MotionShooterGame() {
     setScore(0);
     fruitsRef.current = [];
     particlesRef.current = [];
-    gestureRef.current = { prevShootPose: false };
+    gestureRef.current = { prevIndex: null, lastAimAt: 0 };
     crosshairRef.current = {
       pos: { x: 0.5, y: 0.6 },
       aimPoseActive: false,
-      shootPoseActive: false,
+      shootGestureActive: false,
       lastShotAt: 0,
       confidence: 0,
     };

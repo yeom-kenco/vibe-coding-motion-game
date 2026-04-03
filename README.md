@@ -3,6 +3,11 @@
 웹캠과 손 제스처만으로 과일을 쏘는 브라우저 미니 게임입니다.  
 MediaPipe Hand Landmarker 기반 실시간 손 인식으로, 설치 없이 바로 플레이할 수 있습니다.
 
+
+https://github.com/user-attachments/assets/b1a03356-93e9-48cf-ab3a-553b55df0590
+
+
+
 ## 주요 기능
 
 - **손 제스처 인식** — 검지로 조준, 슈팅 제스처 트리거로 발사
